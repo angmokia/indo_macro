@@ -146,7 +146,7 @@ def _slice(s, start, end):
     idx = s.index
     pos = idx.searchsorted(pd.Timestamp(start)) if start else 0
     if start and pos > 0 and len(idx) > 2:
-        step_days = pd.Series(idx[-25:]).diff().dt.days.median()
+        step_days = float(np.median(np.diff(pd.DatetimeIndex(idx[-25:]).values).astype("timedelta64[D]").astype(float)))
         if step_days >= 25:
             months = max(1, round(step_days / 30.44))
             if idx[pos - 1] + pd.DateOffset(months=months) > pd.Timestamp(start):
@@ -1023,33 +1023,95 @@ with tabs[0]:
         corr = d.corr().iloc[0, 1]
         return {"Beta": round(beta, 2), "Correlation": round(corr, 2), "R²": round(corr ** 2, 2), "Obs": len(d)}
 
-    # Curve snapshot + spread over Treasuries
-    fig_curve = go.Figure()
-    curve_tbl = pd.DataFrame()
+    # ── SBN curve snapshots (same pattern as the Fed funds futures section in usa_macro.py) ──
+    # As-of slider + date picker over every recorded day; the selected date's curve is drawn over
+    # the latest curve (ghosted), with fixed 1W/1M/3M/1Y-ago snapshot lines and a full-history
+    # chart marked at the slider date.
+    SBN_SNAPSHOT_COLORS = {"1W Ago": "#ff9800", "1M Ago": "#66bb6a", "3M Ago": "#e040fb", "1Y Ago": "#ef5350"}
+    fig_asof, fig_snap, fig_hist = go.Figure(), go.Figure(), go.Figure()
+    asof_tbl, snap_tbl, hist_tbl = pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+    as_of = None
     if not sbn.empty:
-        tenors = [c for c in sbn.columns]
+        tenors = list(sbn.columns)
         xs = [float(c[:-1]) for c in tenors]
-        last_d = sbn.index[-1]
-        snaps = [("Latest", last_d, "#4fc3f7", None)]
-        if len(sbn) > 1:
-            snaps.append(("Previous day", sbn.index[-2], "#ff9800", "dash"))
-        m_ago = sbn.loc[:last_d - pd.DateOffset(months=1)]
-        if not m_ago.empty:
-            snaps.append(("1M ago", m_ago.index[-1], "#66bb6a", "dash"))
-        for name, d, color, dash in snaps:
-            row = sbn.loc[d, tenors]
-            curve_tbl[f"SBN {name} ({d.date()})"] = row.values
-            fig_curve.add_trace(go.Scatter(x=xs, y=row.values, mode="lines+markers", name=f"SBN {name} ({d.date()})",
-                                           line=dict(color=color, dash=dash)))
-        us_pts = {t: ust[t].asof(last_d) for t in ust if not ust[t].empty}
-        curve_tbl.index = tenors
-        for t, v in us_pts.items():
-            if t in curve_tbl.index:
-                curve_tbl.loc[t, "UST"] = v
-                curve_tbl.loc[t, "SBN − UST (bps)"] = round((curve_tbl.loc[t].iloc[0] - v) * 100, 1)
-    fig_curve.update_layout(**base_layout("SBN Yield Curve (PHEI IGSYC)"))
-    fig_curve.update_xaxes(title="Tenor (years)")
-    fig_curve.update_yaxes(ticksuffix="%")
+        dates = list(sbn.index)
+        last_d = dates[-1]
+        today_row = sbn.loc[last_d, tenors]
+
+        if len(dates) >= 2:
+            if st.session_state.get("sbn_as_of_slider") not in dates:
+                st.session_state["sbn_as_of_slider"] = last_d
+
+            def _sync_sbn_from_picker():
+                picked = pd.Timestamp(st.session_state.sbn_as_of_picker)
+                idx = sbn.index.get_indexer([picked], method="nearest")[0]
+                st.session_state.sbn_as_of_slider = sbn.index[idx]
+
+            # The picker mirrors the slider through session state rather than value= - a value= that changes
+            # every run makes Streamlit treat the picker as a new widget and drop the user's pick.
+            st.session_state["sbn_as_of_picker"] = st.session_state["sbn_as_of_slider"].date()
+            col_sl, col_dt = st.columns([3, 1])
+            with col_sl:
+                st.select_slider("SBN curve as of (for snapshot comparison)", options=dates,
+                                 format_func=lambda d: d.strftime("%b %d, %Y"), key="sbn_as_of_slider")
+            with col_dt:
+                st.date_input("Or pick a date", min_value=dates[0].date(), max_value=last_d.date(),
+                              key="sbn_as_of_picker", on_change=_sync_sbn_from_picker)
+            as_of = st.session_state.sbn_as_of_slider
+        else:
+            as_of = last_d
+            st.caption("Only one recorded day so far - the as-of slider appears once a second day is recorded.")
+        asof_row = sbn.loc[as_of, tenors]
+        as_of_label = as_of.strftime("%b %d, %Y")
+        chg_bps = (today_row - asof_row) * 100
+
+        # 1) As-of curve vs latest (ghosted), with per-tenor change bars on the right axis
+        fig_asof.add_trace(go.Bar(x=xs, y=chg_bps.values, name=f"Change {as_of:%d %b} → {last_d:%d %b} (bps, rhs)", yaxis="y2",
+                                  marker_color=["#ef5350" if v > 0 else "#26a69a" if v < 0 else "#8a94a6" for v in chg_bps.values],
+                                  opacity=0.45, hovertemplate="%{x}Y: %{y:+.1f}bps<extra></extra>"))
+        fig_asof.add_trace(go.Scatter(x=xs, y=today_row.values, mode="lines+markers", name=f"Latest ({last_d:%b %d, %Y})",
+                                      line=dict(color="rgba(230,233,240,0.35)", width=2), hovertemplate="%{x}Y: %{y:.3f}%<extra></extra>"))
+        fig_asof.add_trace(go.Scatter(x=xs, y=asof_row.values, mode="lines+markers", name=f"As of {as_of_label}",
+                                      line=dict(color="#ffffff", width=2.4), fill="tonexty", fillcolor="rgba(255,255,255,0.08)",
+                                      hovertemplate="%{x}Y: %{y:.3f}%<extra></extra>"))
+        fig_asof.update_layout(**dual_axis_layout(f"SBN Yield Curve — As Of {as_of_label}", "Yield (%)", "Change to latest (bps)"))
+        fig_asof.update_xaxes(title="Tenor (years)")
+        asof_tbl = pd.DataFrame({"Tenor": tenors, f"Latest {last_d.date()}": today_row.values,
+                                 f"As of {as_of.date()}": asof_row.values, "Change (bps)": chg_bps.round(1).values})
+        ust_latest = {t: (ust[t].asof(last_d) if t in ust and not ust[t].empty else np.nan) for t in tenors}
+        asof_tbl["UST latest"] = [ust_latest[t] for t in tenors]
+        asof_tbl["SBN − UST (bps)"] = ((asof_tbl[f"Latest {last_d.date()}"] - asof_tbl["UST latest"]) * 100).round(1)
+
+        # 2) Snapshots: latest + as-of + fixed look-backs (each only once that much history is recorded)
+        fig_snap.add_trace(go.Scatter(x=xs, y=today_row.values, mode="lines+markers", name=f"Latest ({last_d:%b %d})",
+                                      line=dict(color="#4fc3f7", width=2)))
+        if as_of != last_d:
+            fig_snap.add_trace(go.Scatter(x=xs, y=asof_row.values, mode="lines+markers", name=f"As of {as_of_label}",
+                                          line=dict(color="#ffffff", width=2.2), fill="tonexty", fillcolor="rgba(255,255,255,0.08)"))
+        snap_tbl = pd.DataFrame({"Tenor": tenors, f"Latest {last_d.date()}": today_row.values})
+        missing_snaps = []
+        for label, offset in [("1W Ago", pd.Timedelta(days=7)), ("1M Ago", pd.DateOffset(months=1)),
+                              ("3M Ago", pd.DateOffset(months=3)), ("1Y Ago", pd.DateOffset(years=1))]:
+            sub = sbn.loc[:last_d - offset]
+            if sub.empty:
+                missing_snaps.append(label)
+                continue
+            d, row = sub.index[-1], sub.iloc[-1][tenors]
+            fig_snap.add_trace(go.Scatter(x=xs, y=row.values, mode="lines+markers", name=f"{label} ({d:%b %d})",
+                                          line=dict(color=SBN_SNAPSHOT_COLORS[label], width=1, dash="dash")))
+            snap_tbl[f"{label} {d.date()}"] = row.values
+        fig_snap.update_layout(**base_layout("SBN Yield Curve — Snapshots"))
+        fig_snap.update_xaxes(title="Tenor (years)")
+        fig_snap.update_yaxes(ticksuffix="%")
+
+        # 3) Full recorded history of key tenors, marker at the slider date
+        hist_cols = [t for t in ["1Y", "5Y", "10Y", "30Y"] if t in sbn]
+        hist_tbl = sbn[hist_cols]
+        for t, color in zip(hist_cols, ["#42a5f5", "#26a69a", "#ff9800", "#ab47bc"]):
+            fig_hist.add_trace(go.Scatter(x=sbn.index, y=sbn[t], mode="lines+markers", name=f"SBN {t}", line=dict(color=color, width=1.6)))
+        fig_hist.add_vline(x=as_of, line_dash="solid", line_color="#4fc3f7", line_width=1.5)
+        fig_hist.update_layout(**base_layout("SBN Yields — Recorded History (marker = slider date)"))
+        fig_hist.update_yaxes(ticksuffix="%")
 
     # Policy-rate beta: BI rate vs Fed (available now, full history)
     fig_pol = go.Figure()
@@ -1072,9 +1134,14 @@ with tabs[0]:
     fig_pol.update_layout(**dual_axis_layout("BI Rate vs Fed Policy Rate", "%", "Spread (pp)"))
     add_episodes(fig_pol, episodes)
     render_two_col([
-        ("SBN Yield Curve", fig_curve, curve_tbl),
+        ("SBN Yield Curve As Of", fig_asof, asof_tbl),
+        ("SBN Yield Curve Snapshots", fig_snap, snap_tbl),
+        ("SBN Yields Recorded History", fig_hist, hist_tbl),
         ("BI Rate vs Fed", fig_pol, pol_tbl),
     ])
+    if not sbn.empty and missing_snaps:
+        st.caption(f"Snapshot lines {', '.join(missing_snaps)} appear automatically once that much SBN history has been "
+                   f"recorded (recording started {sbn.index.min():%b %d, %Y}).")
     if not pol_tbl.empty:
         st.markdown("**Policy-rate beta** — quarterly change in the BI rate regressed on the quarterly change in the Fed "
                     "policy rate (beta 0.5 = BI typically moves 50bp for every 100bp the Fed moves):")
