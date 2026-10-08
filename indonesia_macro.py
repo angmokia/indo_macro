@@ -1019,16 +1019,27 @@ def build_sbn_monitor(sbn: pd.DataFrame, bi_rate: pd.Series):
     o = np.argsort(xs)
     xs, ys = xs[o], ys[o]
 
+    def _mdur(y, T):
+        """Modified duration of a par bond (semi-annual coupons) with T years left; 0 once it has matured."""
+        return 0.0 if T <= 0 else (1 - (1 + y / 200) ** (-2 * T)) / (y / 100)
+
+    # Every number is expressed in bp of yield per unit of TODAY's DV01, so DV01-neutral legs simply add:
+    #   breakeven carry = (yield − BI rate) / D(T)
+    #   roll            = [y(T) − y(T−1)] × D(T−1) / D(T)
+    # The roll uses the duration the bond will have a year from now - the yield drop from rolling down the
+    # curve is earned on a bond that has become one year shorter. A 1Y held for a year matures at par, so its
+    # whole excess return is carry and its roll is 0 (multiplying by the current duration double-counted it).
     legs = {}
     for t, T in SBN_RM_TENORS.items():
         if t not in last:
             continue
         y = float(last[t])
-        dur = (1 - (1 + y / 200) ** (-2 * T)) / (y / 100)       # modified duration, par bond, semi-annual
-        running = (y - fund) * 100                               # bp/yr, holding the tenor funded at the BI rate
-        be = running / dur                                       # bp of yield one year of carry offsets
-        roll = (y - np.interp(T - 1, xs, ys)) * 100              # 1Y roll on today's curve (1Y rolls to the BI rate)
-        legs[t] = (running, be, roll)
+        y_h = float(np.interp(T - 1, xs, ys))                    # yield of the T-1 point on today's curve (0Y = BI rate)
+        d_now, d_h = _mdur(y, T), _mdur(y_h, T - 1)
+        running = (y - fund) * 100                               # bp/yr of notional, holding the tenor funded at BI rate
+        be = running / d_now                                     # bp of yield (per unit of today's DV01)
+        roll = (y - y_h) * 100 * d_h / d_now                     # bp of yield (per unit of today's DV01)
+        legs[t] = (running, be, roll, y, d_now)
 
     def row(name, s, unit, running=np.nan, be=np.nan, roll=np.nan):
         s = s.dropna()
@@ -1045,7 +1056,7 @@ def build_sbn_monitor(sbn: pd.DataFrame, bi_rate: pd.Series):
                 "Carry+Roll (bp yld/yr)": cr, "1Y vol (bp)": vol,
                 "C+R / Vol": cr / vol if pd.notna(cr) and pd.notna(vol) and vol else np.nan, "As of": s.index[-1]}
 
-    outr = [row("BI Rate", fund_s, "%")] + [row(f"{t} SBN", curve[t], "%", *legs[t]) for t in SBN_RM_TENORS if t in legs]
+    outr = [row("BI Rate", fund_s, "%")] + [row(f"{t} SBN", curve[t], "%", *legs[t][:3]) for t in SBN_RM_TENORS if t in legs]
 
     def combo(defs):
         rows = []
@@ -1060,7 +1071,7 @@ def build_sbn_monitor(sbn: pd.DataFrame, bi_rate: pd.Series):
     front = ((curve["1Y"] - fund_s.reindex(curve.index, method="ffill")) * 100).dropna() if "1Y" in curve else pd.Series(dtype=float)
     spr = combo(SBN_RM_SPREADS) + ([row("1Y SBN − BI Rate", front, "bp")] if not front.empty else [])
     fly = combo(SBN_RM_FLIES)
-    return pd.DataFrame(outr), pd.DataFrame(spr), pd.DataFrame(fly), fund, fund_dt
+    return pd.DataFrame(outr), pd.DataFrame(spr), pd.DataFrame(fly), fund, fund_dt, legs
 
 def _rm_zcolor(v):
     if pd.isna(v):
@@ -1147,26 +1158,71 @@ with tabs[0]:
     with st.expander("Rates Monitor — SBN outrights, spreads & flies", expanded=True):
         with st.spinner("Building rates monitor…"):
             try:
-                rm_out, rm_spr, rm_fly, rm_fund, rm_fund_dt = build_sbn_monitor(load_sbn_history(record=True), bi_d)
+                rm_out, rm_spr, rm_fly, rm_fund, rm_fund_dt, rm_legs = build_sbn_monitor(load_sbn_history(record=True), bi_d)
             except Exception as e:
                 st.warning(f"Could not build the SBN rates monitor: {e}")
                 rm_out = None
         if rm_out is not None:
             n_hist = len(load_sbn_history(record=False))
             st.caption(f"Carry is for holding each SBN tenor funded at the BI rate ({rm_fund:.2f}% on {rm_fund_dt:%d %b}), "
-                       "and the BI rate is used as the 0-year point of the curve - so the 1Y rolls down to the BI rate and "
-                       "1Y-based spreads/flies (1s10s, 1s5s10s, …) get carry & roll too. Carry (bp/yr) = (yield − BI rate) × 100. "
-                       "Breakeven carry = that ÷ modified duration (the yield rise one year of carry offsets). Roll 1Y = rolldown "
-                       "on today's PHEI curve. C+R / Vol = (breakeven carry + roll) ÷ 1Y realised vol. Spreads & flies are "
-                       "DV01-neutral and shown for being LONG the spread (steepener / long fly, i.e. paying the positive-weight "
-                       "legs). Changes, z-scores, percentiles and vol use the recorded PHEI history "
+                       "and the BI rate is used as the 0-year point of the curve. Carry (bp/yr) = (yield − BI rate) × 100. "
+                       "Breakeven carry = that ÷ modified duration. Roll 1Y = the yield drop from rolling one year down today's "
+                       "PHEI curve × the bond's duration a year from now ÷ today's duration (so a 1Y, which simply matures, has "
+                       "no roll - all its return is carry). Both are in bp of yield per unit of today's DV01, so DV01-neutral "
+                       "spread/fly legs add straight up. C+R / Vol = (breakeven carry + roll) ÷ 1Y realised vol. "
+                       "Changes, z-scores, percentiles and vol use the recorded PHEI history "
                        f"({n_hist} day{'s' if n_hist != 1 else ''} so far), so they fill in as it builds - carry & roll work from day one.")
             with st.expander("Outright Rates", expanded=True):
                 render_rates_monitor_table(rm_out, "outright", show_running=True)
+            rm_side = st.radio("Spreads & flies shown for", ["Steepener / long fly", "Flattener / short fly"], horizontal=True,
+                               key="sbn_rm_side",
+                               help="Steepener = receive the short leg, pay the long leg (profits if the spread widens). "
+                                    "Flattener = the reverse. Long fly = pay the belly, receive the wings. Level, changes and "
+                                    "z-scores describe the spread itself and don't change; carry and roll flip sign.")
+            sign = 1 if rm_side.startswith("Steepener") else -1
+            pnl_cols = ["Breakeven carry (bp yld/yr)", "Roll 1Y (bp)", "Carry+Roll (bp yld/yr)", "C+R / Vol"]
+
+            def _side(df):
+                df = df.copy()
+                for c in pnl_cols:
+                    if c in df:
+                        df[c] = df[c] * sign
+                return df
             with st.expander("Spreads", expanded=True):
-                render_rates_monitor_table(rm_spr, "spreads", show_running=False)
+                render_rates_monitor_table(_side(rm_spr), "spreads", show_running=False)
             with st.expander("Flies", expanded=True):
-                render_rates_monitor_table(rm_fly, "flies", show_running=False)
+                render_rates_monitor_table(_side(rm_fly), "flies", show_running=False)
+
+            with st.expander("Leg breakdown — how a spread's carry & roll nets out", expanded=False):
+                combos = {**SBN_RM_SPREADS, **SBN_RM_FLIES}
+                pick = st.selectbox("Spread or fly", [n for n, w in combos.items() if all(k in rm_legs for k in w)],
+                                    index=list(combos).index("1s10s") if "1s10s" in combos else 0, key="sbn_rm_leg_pick")
+                w = combos[pick]
+                # DV01-neutral notionals: each leg's |weight| units of DV01, i.e. notional ∝ |weight| / duration,
+                # scaled so the longest-tenor leg is 1.00
+                ref = max(w, key=lambda k: SBN_RM_TENORS[k])
+                rows = []
+                for k, wt in sorted(w.items(), key=lambda kv: SBN_RM_TENORS[kv[0]]):
+                    running, be, roll, y, d_now = rm_legs[k]
+                    pos = -1 * np.sign(wt) * sign                          # +1 = receive (long the bond), -1 = pay
+                    rows.append({"Leg": f"{k} SBN", "Yield": f"{y:.3f}%", "Position": "Receive (long bond)" if pos > 0 else "Pay (short bond)",
+                                 "DV01 weight": abs(wt), "Notional vs longest leg": abs(wt) / d_now / (abs(w[ref]) / rm_legs[ref][4]),
+                                 "Carry (bp yld/yr)": pos * abs(wt) * be, "Roll (bp)": pos * abs(wt) * roll,
+                                 "Carry+Roll (bp)": pos * abs(wt) * (be + roll)})
+                legs_df = pd.DataFrame(rows)
+                total = {"Leg": "Net", "Yield": "", "Position": rm_side, "DV01 weight": np.nan, "Notional vs longest leg": np.nan,
+                         **{c: legs_df[c].sum() for c in ["Carry (bp yld/yr)", "Roll (bp)", "Carry+Roll (bp)"]}}
+                legs_df = pd.concat([legs_df, pd.DataFrame([total])], ignore_index=True)
+                disp = legs_df.copy()
+                for c, f in [("DV01 weight", ".0f"), ("Notional vs longest leg", ".2f"), ("Carry (bp yld/yr)", "+.1f"),
+                             ("Roll (bp)", "+.1f"), ("Carry+Roll (bp)", "+.1f")]:
+                    disp[c] = ["" if pd.isna(v) else format(v, f) for v in legs_df[c]]
+                st.table(disp.set_index("Leg"))
+                st.caption("Each leg is sized to its DV01 weight (spreads 1:1, flies 1:2:1), so a parallel move nets to zero - "
+                           "which needs a much larger notional in the short leg. Carry and roll are in bp of yield per unit of "
+                           "DV01, so the legs add straight up to the net. Short tenors carry more per unit of DV01 (their "
+                           "yield-minus-BI-rate is spread over a small duration), which is why steepeners earn and "
+                           "flatteners pay carry on a steep front end.")
 
     deposit = imf_pick(ir_raw, INDICATOR="MFS135_RT_PT_A_PT").rename("Deposit Rate")
     lending = imf_pick(ir_raw, INDICATOR="MFS162_RT_PT_A_PT").rename("Lending Rate")
