@@ -356,6 +356,77 @@ def load_sbn_history(record=True):
             st.warning(f"Could not record today's SBN curve from PHEI: {e}")
     return hist.sort_index()
 
+# ── Bank Indonesia indicator pages (fresher than the IMF mirror) ──────────────
+# The IMF republishes BI/BPS data with a 1-2 month lag. Two of BI's public indicator pages are
+# plain HTML tables that run ahead of it (verified 2026-10-09): monthly CPI YoY (10 latest
+# months) and the monetary-indicators table, whose memo item is official FX reserves (IRFCL,
+# USD mn) for the latest two month-ends. They only EXTEND the IMF series - months the IMF
+# already has keep the IMF value (they matched on the overlap: July CPI 2.88% in both).
+BI_INFLATION_URL = "https://www.bi.go.id/id/statistik/indikator/data-inflasi.aspx"
+BI_MONETARY_URL = "https://www.bi.go.id/id/statistik/indikator/indikator-moneter.aspx"
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def _bi_inflation_raw() -> pd.Series:
+    def run():
+        r = _http_get(BI_INFLATION_URL, slot="other")
+        t = pd.read_html(io.StringIO(r.text))[0]
+        out = {}
+        for period, val in zip(t.iloc[:, 0].astype(str), t.iloc[:, 1].astype(str)):
+            m = re.match(r"\s*([A-Za-z]+)\s+(\d{4})", period)
+            v = re.search(r"-?\d+(?:[.,]\d+)?", val)
+            if m and v and m.group(1).lower() in ID_MONTHS:
+                out[pd.Timestamp(int(m.group(2)), ID_MONTHS[m.group(1).lower()], 1)] = float(v.group(0).replace(",", "."))
+        if not out:
+            raise ValueError("BI inflation page layout changed")
+        return pd.Series(out).sort_index()
+    return _guarded(("bi_inflation",), run)
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def _bi_reserves_raw() -> pd.Series:
+    """Official FX reserves (IRFCL, USD bn) for the month-ends on BI's monetary-indicators page."""
+    def run():
+        r = _http_get(BI_MONETARY_URL, slot="other")
+        t = pd.read_html(io.StringIO(r.text))[0]
+        label_cols = [c for c in t.columns if str(c).startswith("Items")]
+        row = t[t[label_cols].astype(str).apply(lambda col: col.str.contains("Cadangan Devisa", case=False)).any(axis=1)]
+        if row.empty:
+            raise ValueError("BI monetary-indicators page layout changed (reserves row not found)")
+        out = {}
+        for c in t.columns:
+            try:
+                d = pd.to_datetime(str(c), format="%d %b %Y")
+            except (ValueError, TypeError):
+                continue
+            out[pd.Timestamp(d.year, d.month, 1)] = float(row.iloc[0][c]) / 1e3
+        return pd.Series(out).sort_index()
+    return _guarded(("bi_reserves",), run)
+
+def _extend_with(base: pd.Series, newer: pd.Series) -> pd.Series:
+    """base + only the newer source's months after base's last month."""
+    if newer is None or newer.empty:
+        return base
+    if base.empty:
+        return newer
+    return pd.concat([base, newer[newer.index > base.index.max()]]).sort_index()
+
+def cpi_yoy_series(cpi_raw) -> pd.Series:
+    imf = imf_pick(cpi_raw, TYPE_OF_TRANSFORMATION="YOY_PCH_PA_PT")
+    try:
+        bi_ = _bi_inflation_raw()
+    except Exception:
+        bi_ = pd.Series(dtype=float)
+    return _extend_with(imf, bi_)
+
+def reserves_total_series(il_raw) -> pd.Series:
+    # Gold at NATIONAL valuation (TRGNV) - BI's own published basis: Aug-2026 IMF 146.49bn vs BI 146.51bn,
+    # whereas the market-value series (TRGMV, 146.82bn) would put a fake ~0.3bn step at the splice.
+    imf = imf_pick(il_raw, INDICATOR="TRGNV_REVS") / 1e9
+    try:
+        bi_ = _bi_reserves_raw()
+    except Exception:
+        bi_ = pd.Series(dtype=float)
+    return _extend_with(imf, bi_)
+
 # ── FRED (US Treasury yields for the IDR-vs-US rate beta) ─────────────────────
 FRED_API_KEY = os.getenv("FRED_API_KEY")
 UST_SERIES = {"1Y": "DGS1", "5Y": "DGS5", "10Y": "DGS10"}
@@ -733,6 +804,8 @@ prefetch(_yf_batch_raw, tuple(MACRO_TICKERS), MARKETS_HIST_START)
 start_comtrade_worker()
 prefetch(_yf_batch_raw, tuple(VOL_TICKERS), MARKETS_HIST_START)
 prefetch(_phei_curve_raw)
+prefetch(_bi_inflation_raw)
+prefetch(_bi_reserves_raw)
 prefetch(_bis_raw, "WS_CBPOL", "D.US")
 if FRED_API_KEY:
     for _sid in UST_SERIES.values():
@@ -769,7 +842,7 @@ def get_summary_metrics(end):
         return _imf_raw(*req)
 
     def cpi_yoy():
-        return imf_pick(load(REQ_CPI), TYPE_OF_TRANSFORMATION="YOY_PCH_PA_PT")
+        return cpi_yoy_series(load(REQ_CPI))
 
     def bi_rate():
         return _bis_raw("WS_CBPOL", "D.ID")
@@ -793,7 +866,7 @@ def get_summary_metrics(end):
         return ((imf_pick(raw, INDICATOR="XG", TYPE_OF_TRANSFORMATION="FOB_USD") - imf_pick(raw, INDICATOR="MG", TYPE_OF_TRANSFORMATION="CIF_USD")) / 1e9).dropna()
 
     def reserves():
-        return imf_pick(load(REQ_IL), INDICATOR="TRGMV_REVS") / 1e9
+        return reserves_total_series(load(REQ_IL))
 
     def import_cover():
         m = imf_pick(load(REQ_ITG), INDICATOR="MG", TYPE_OF_TRANSFORMATION="CIF_USD").rolling(3).mean() / 1e9
@@ -908,6 +981,139 @@ for row_start in range(0, len(summary_items), ROW_SIZE):
 
 st.markdown("<br>", unsafe_allow_html=True)
 
+# ── SBN Rates Monitor (outrights / spreads / flies) - port of usa_macro.py's Rates Monitor ──
+# Uses the full recorded SBN history (not the date-slider slice), so z-scores and percentiles
+# don't change when the date range narrows. Differences from the US version:
+#   * funding / carry is the BI rate (BI's 7-day reverse repo policy rate), and
+#   * the BI rate is the 0-year point of the curve, so the 1Y SBN "rolls down" to the BI rate -
+#     which is what lets 1Y-based spreads and flies (e.g. 1s10s) get a carry & roll number,
+#     whereas the US monitor leaves sub-1Y legs blank.
+SBN_RM_TENORS = {"1Y": 1, "2Y": 2, "3Y": 3, "5Y": 5, "7Y": 7, "10Y": 10, "15Y": 15, "20Y": 20, "30Y": 30}
+# spread/fly = Σ weight × yield (bp). "Long" = steepener / long fly = pay the positive-weight legs.
+SBN_RM_SPREADS = {"1s5s": {"5Y": 1, "1Y": -1}, "1s10s": {"10Y": 1, "1Y": -1}, "2s5s": {"5Y": 1, "2Y": -1},
+                  "2s10s": {"10Y": 1, "2Y": -1}, "5s10s": {"10Y": 1, "5Y": -1}, "5s30s": {"30Y": 1, "5Y": -1},
+                  "10s30s": {"30Y": 1, "10Y": -1}}
+SBN_RM_FLIES = {"1s5s10s": {"5Y": 2, "1Y": -1, "10Y": -1}, "2s5s10s": {"5Y": 2, "2Y": -1, "10Y": -1},
+                "5s10s30s": {"10Y": 2, "5Y": -1, "30Y": -1}, "10s20s30s": {"20Y": 2, "10Y": -1, "30Y": -1},
+                "1s10s20s": {"10Y": 2, "1Y": -1, "20Y": -1}}
+
+def _rm_pctile(s, years):
+    w = s[s.index >= s.index[-1] - pd.DateOffset(years=years)]
+    return float((w <= w.iloc[-1]).mean() * 100) if len(w) > 20 else np.nan
+
+def _rm_chg(s, offset):
+    prev = s.asof(s.index[-1] - offset)
+    return float(s.iloc[-1] - prev) if pd.notna(prev) else np.nan
+
+def build_sbn_monitor(sbn: pd.DataFrame, bi_rate: pd.Series):
+    """Returns (outrights_df, spreads_df, flies_df, funding_level, funding_date)."""
+    curve = sbn[[t for t in SBN_RM_TENORS if t in sbn]].dropna(how="all").sort_index()
+    fund_s = bi_rate.dropna().sort_index()
+    if curve.empty or fund_s.empty:
+        raise ValueError("no recorded SBN curve or BI rate yet")
+    fund_dt = curve.index[-1]
+    fund = float(fund_s.asof(fund_dt))
+    last = curve.iloc[-1].dropna()
+    xs = np.array([0.0] + [float(SBN_RM_TENORS[t]) for t in last.index])   # BI rate = the 0Y point
+    ys = np.array([fund] + list(last.values))
+    o = np.argsort(xs)
+    xs, ys = xs[o], ys[o]
+
+    legs = {}
+    for t, T in SBN_RM_TENORS.items():
+        if t not in last:
+            continue
+        y = float(last[t])
+        dur = (1 - (1 + y / 200) ** (-2 * T)) / (y / 100)       # modified duration, par bond, semi-annual
+        running = (y - fund) * 100                               # bp/yr, holding the tenor funded at the BI rate
+        be = running / dur                                       # bp of yield one year of carry offsets
+        roll = (y - np.interp(T - 1, xs, ys)) * 100              # 1Y roll on today's curve (1Y rolls to the BI rate)
+        legs[t] = (running, be, roll)
+
+    def row(name, s, unit, running=np.nan, be=np.nan, roll=np.nan):
+        s = s.dropna()
+        m = 100 if unit == "%" else 1
+        z = _zscores(s, Z_WINDOWS["D"])
+        vol = s.diff().iloc[-252:].std() * m * np.sqrt(252) if len(s) > 21 else np.nan
+        cr = be + roll
+        return {"Instrument": name, "Level": float(s.iloc[-1]), "_unit": unit,
+                "Δ1D (bp)": (s.iloc[-1] - s.iloc[-2]) * m if len(s) > 1 else np.nan,
+                "Δ1W (bp)": _rm_chg(s, pd.Timedelta(days=7)) * m, "Δ1M (bp)": _rm_chg(s, pd.DateOffset(months=1)) * m,
+                "Δ3M (bp)": _rm_chg(s, pd.DateOffset(months=3)) * m,
+                "Z 1M": z["1M"], "Z 3M": z["3M"], "Z 12M": z["12M"], "1Y %ile": _rm_pctile(s, 1), "5Y %ile": _rm_pctile(s, 5),
+                "Carry (bp/yr)": running, "Breakeven carry (bp yld/yr)": be, "Roll 1Y (bp)": roll,
+                "Carry+Roll (bp yld/yr)": cr, "1Y vol (bp)": vol,
+                "C+R / Vol": cr / vol if pd.notna(cr) and pd.notna(vol) and vol else np.nan, "As of": s.index[-1]}
+
+    outr = [row("BI Rate", fund_s, "%")] + [row(f"{t} SBN", curve[t], "%", *legs[t]) for t in SBN_RM_TENORS if t in legs]
+
+    def combo(defs):
+        rows = []
+        for n, w in defs.items():
+            if not all(k in legs for k in w):
+                continue
+            s_ = sum(curve[k] * v for k, v in w.items()).dropna() * 100
+            be = -sum(v * legs[k][1] for k, v in w.items())       # DV01-neutral legs add in bp of yield
+            roll = -sum(v * legs[k][2] for k, v in w.items())
+            rows.append(row(n, s_, "bp", np.nan, be, roll))
+        return rows
+    front = ((curve["1Y"] - fund_s.reindex(curve.index, method="ffill")) * 100).dropna() if "1Y" in curve else pd.Series(dtype=float)
+    spr = combo(SBN_RM_SPREADS) + ([row("1Y SBN − BI Rate", front, "bp")] if not front.empty else [])
+    fly = combo(SBN_RM_FLIES)
+    return pd.DataFrame(outr), pd.DataFrame(spr), pd.DataFrame(fly), fund, fund_dt
+
+def _rm_zcolor(v):
+    if pd.isna(v):
+        return "color: #5f6b7e"
+    a = min(abs(v) / 2.5, 1.0)
+    return f"background-color: rgba({'38,166,154' if v > 0 else '239,83,80'},{0.10 + 0.5 * a:.2f}); color: #e0e0e0"
+
+def _rm_signcolor(v):
+    return "color: #8a94a6" if pd.isna(v) or v == 0 else ("color: #26a69a" if v > 0 else "color: #ef5350")
+
+def _rm_pctcolor(v):
+    return "color: #5f6b7e" if pd.isna(v) else _rm_zcolor((v - 50) / 20)
+
+def render_rates_monitor_table(df, key, show_running):
+    """One monitor table with its own multi-column sort controls (priority order + per-column direction)."""
+    if not show_running:
+        df = df.drop(columns="Carry (bp/yr)")
+    sortable = [c for c in df.columns if not c.startswith("_")]
+    s1, s2 = st.columns([3, 2])
+    sort_cols = s1.multiselect("Sort by (priority order — first pick sorts first)", sortable, default=[],
+                               key=f"sbn_rm_sort_{key}", placeholder="Default order")
+    asc = []
+    if sort_cols:
+        for dc, col in zip(s2.columns(len(sort_cols)), sort_cols):
+            asc.append(dc.radio(col, ["↓ Desc", "↑ Asc"], key=f"sbn_rm_dir_{key}_{col}") == "↑ Asc")
+    else:
+        s2.caption("Pick one or more columns to sort by, or click a column header for a quick single-column sort.")
+    if sort_cols:
+        df = df.sort_values(sort_cols, ascending=asc, na_position="last", kind="mergesort")
+    view = df.copy()
+    view["Level"] = [f"{v:.3f}%" if u == "%" else f"{v:+.1f}bp" for v, u in zip(view["Level"], view["_unit"])]
+    view["As of"] = view["As of"].dt.strftime("%d %b")
+    view = view.drop(columns="_unit")
+    chg = ["Δ1D (bp)", "Δ1W (bp)", "Δ1M (bp)", "Δ3M (bp)"]
+    carry = [c for c in ["Carry (bp/yr)", "Breakeven carry (bp yld/yr)", "Roll 1Y (bp)", "Carry+Roll (bp yld/yr)"] if c in view]
+    # Display values are pre-formatted text ("—" for missing) - st.dataframe ignores a Styler's formatting for
+    # missing values and prints "None" (verified 2026-10-09) - while the colours are computed from the numbers.
+    formats = {**{c: "+.1f" for c in chg + carry}, "Z 1M": "+.2f", "Z 3M": "+.2f", "Z 12M": "+.2f",
+               "1Y %ile": ".0f", "5Y %ile": ".0f", "1Y vol (bp)": ".0f", "C+R / Vol": "+.2f"}
+    num = view.copy()
+    for c, f in formats.items():
+        if c in view:
+            num[c] = pd.to_numeric(num[c], errors="coerce")
+            view[c] = ["—" if pd.isna(v) else format(v, f) for v in num[c]]
+    def _colors(fn, cols):
+        return lambda col: [fn(v) for v in num[col.name]] if col.name in cols else [""] * len(col)
+    zc = ["Z 1M", "Z 3M", "Z 12M", "C+R / Vol"]
+    pc = ["1Y %ile", "5Y %ile"]
+    styled = (view.style.apply(_colors(_rm_signcolor, chg + carry), subset=[c for c in chg + carry if c in view])
+              .apply(_colors(_rm_zcolor, zc), subset=zc).apply(_colors(_rm_pctcolor, pc), subset=pc))
+    st.dataframe(styled, hide_index=True, use_container_width=True, height=36 * (len(view) + 1))
+    csv_download(df.drop(columns="_unit").set_index("Instrument"), f"sbn_rates_monitor_{key}")
+
 tabs = st.tabs([
     "BI & Rates",
     "Prices",
@@ -938,10 +1144,34 @@ with tabs[0]:
         ma_raw = imf_load(*REQ_MA, what="money aggregates")
         mk = fetch_yf_batch(MACRO_TICKERS, MARKETS_HIST_START)
 
+    with st.expander("Rates Monitor — SBN outrights, spreads & flies", expanded=True):
+        with st.spinner("Building rates monitor…"):
+            try:
+                rm_out, rm_spr, rm_fly, rm_fund, rm_fund_dt = build_sbn_monitor(load_sbn_history(record=True), bi_d)
+            except Exception as e:
+                st.warning(f"Could not build the SBN rates monitor: {e}")
+                rm_out = None
+        if rm_out is not None:
+            n_hist = len(load_sbn_history(record=False))
+            st.caption(f"Carry is for holding each SBN tenor funded at the BI rate ({rm_fund:.2f}% on {rm_fund_dt:%d %b}), "
+                       "and the BI rate is used as the 0-year point of the curve - so the 1Y rolls down to the BI rate and "
+                       "1Y-based spreads/flies (1s10s, 1s5s10s, …) get carry & roll too. Carry (bp/yr) = (yield − BI rate) × 100. "
+                       "Breakeven carry = that ÷ modified duration (the yield rise one year of carry offsets). Roll 1Y = rolldown "
+                       "on today's PHEI curve. C+R / Vol = (breakeven carry + roll) ÷ 1Y realised vol. Spreads & flies are "
+                       "DV01-neutral and shown for being LONG the spread (steepener / long fly, i.e. paying the positive-weight "
+                       "legs). Changes, z-scores, percentiles and vol use the recorded PHEI history "
+                       f"({n_hist} day{'s' if n_hist != 1 else ''} so far), so they fill in as it builds - carry & roll work from day one.")
+            with st.expander("Outright Rates", expanded=True):
+                render_rates_monitor_table(rm_out, "outright", show_running=True)
+            with st.expander("Spreads", expanded=True):
+                render_rates_monitor_table(rm_spr, "spreads", show_running=False)
+            with st.expander("Flies", expanded=True):
+                render_rates_monitor_table(rm_fly, "flies", show_running=False)
+
     deposit = imf_pick(ir_raw, INDICATOR="MFS135_RT_PT_A_PT").rename("Deposit Rate")
     lending = imf_pick(ir_raw, INDICATOR="MFS162_RT_PT_A_PT").rename("Lending Rate")
     fx_dep = imf_pick(ir_raw, INDICATOR="MFS135_FC_RT_PT_A_PT").rename("USD Deposit Rate")
-    cpi_yoy = imf_pick(cpi_raw, TYPE_OF_TRANSFORMATION="YOY_PCH_PA_PT").rename("CPI YoY")
+    cpi_yoy = cpi_yoy_series(cpi_raw).rename("CPI YoY")
 
     fig_r = go.Figure()
     s = _clip(bi_d)
@@ -1197,7 +1427,7 @@ with tabs[1]:
         spp_n = bis("WS_SPP", "Q.ID.N.628", "Nominal House Prices")
 
     cpi_idx = imf_pick(cpi_raw, TYPE_OF_TRANSFORMATION="IX").rename("CPI Index")
-    cpi_yoy = imf_pick(cpi_raw, TYPE_OF_TRANSFORMATION="YOY_PCH_PA_PT").rename("CPI YoY %")
+    cpi_yoy = cpi_yoy_series(cpi_raw).rename("CPI YoY %")
     cpi_mom = imf_pick(cpi_raw, TYPE_OF_TRANSFORMATION="POP_PCH_PA_PT").rename("CPI MoM %")
 
     fig_cpi = go.Figure()
@@ -1262,7 +1492,9 @@ with tabs[1]:
     else:
         st.info("BPS_API_KEY found - the BPS breakdown loader still needs wiring against BPS's variable IDs "
                 "(they can only be looked up with a key). Ask Claude to finish this section.")
-    st.caption("Headline CPI: IMF CPI dataset (BPS source data, ~1-2 month lag). MoM is not seasonally adjusted, so "
+    st.caption("Headline CPI: IMF CPI dataset (BPS source data), extended with the newest month(s) from Bank "
+               "Indonesia's inflation page (YoY only; identical to the IMF on every overlapping month). The very latest "
+               "BPS release can still be a month ahead of both - that needs BPS_API_KEY. MoM is not seasonally adjusted, so "
                "Ramadan/Eid months show seasonal food & transport spikes. BI's inflation target band shown is the "
                "2.5% ±1pp target in force since 2024.")
 
@@ -1280,11 +1512,11 @@ with tabs[2]:
 
     comp = pd.DataFrame({
         "Foreign Exchange": imf_pick(il_raw, INDICATOR="RXF11FX_REVS"),
-        "Gold (market value)": imf_pick(il_raw, INDICATOR="RGOLDMV_REVS"),
+        "Gold": imf_pick(il_raw, INDICATOR="RGOLDNV_REVS"),
         "SDRs": imf_pick(il_raw, INDICATOR="RXDR_REVS"),
         "IMF Reserve Position": imf_pick(il_raw, INDICATOR="TRRPIMF_REVS"),
     }) / 1e9
-    total_res = imf_pick(il_raw, INDICATOR="TRGMV_REVS") / 1e9
+    total_res = reserves_total_series(il_raw)
     comp_c, total_c = _clip(comp.dropna(how="all")), _clip(total_res)
     fig_res = go.Figure()
     for c_, color in zip(comp_c.columns, ["#42a5f5", "#eda100", "#ab47bc", "#26a69a"]):
@@ -1339,7 +1571,9 @@ with tabs[2]:
         ("USD IDR", fig_idr, _clip(idr_full)),
         ("Effective Exchange Rates", fig_eer, eer),
     ])
-    st.caption("Reserves: IMF International Liquidity (BI data; gold at market value). Bank Indonesia's own 'months of "
+    st.caption("Reserves: IMF International Liquidity (BI data, gold at national valuation = BI's published basis), "
+               "extended with the latest month-end from Bank Indonesia's monetary-indicators page (total only - the "
+               "breakdown by type follows on the IMF release). Bank Indonesia's own 'months of "
                "imports' figure also adds government external debt service, so it reads a little lower than this "
                "goods-imports-only measure. The intervention gauge is indicative - reserves also move with valuation "
                "changes and government FX borrowing/repayments.")
