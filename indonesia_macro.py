@@ -213,6 +213,32 @@ def bis(flow, key, label, start=None, end=None, warn=True) -> pd.Series:
             st.warning(f"Could not load {label} from the BIS: {e}")
         return pd.Series(dtype=float, name=label)
 
+# ── IMF Fiscal Monitor (DataMapper API) - annual general-government aggregates incl. projections ──
+# (the WEO's own GGR_NGDP / GGX_NGDP / GGXONLB_NGDP codes are not on the DataMapper - verified)
+WEO_BASE = "https://www.imf.org/external/datamapper/api/v1"
+WEO_FISCAL = {"GGXCNL_G01_GDP_PT": "Overall balance", "GGXONLB_G01_GDP_PT": "Primary balance",
+              "GGCBP_G01_PGDP_PT": "Cyclically adj. primary balance", "GGR_G01_GDP_PT": "Revenue",
+              "G_X_G01_GDP_PT": "Expenditure", "G_XWDG_G01_GDP_PT": "Gross debt"}
+FISCAL_PEERS = {"IDN": "Indonesia", "IND": "India", "PHL": "Philippines", "MYS": "Malaysia", "THA": "Thailand",
+                "VNM": "Vietnam", "CHN": "China", "BRA": "Brazil", "MEX": "Mexico", "ZAF": "South Africa", "TUR": "Türkiye"}
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def _weo_raw(indicators: tuple, countries: tuple) -> dict:
+    """{indicator: DataFrame(year x country)}. The DataMapper returns non-JSON to a browser
+    User-Agent (verified), so this sends requests' default one. Pure - raises on failure."""
+    def run():
+        r = _http_get(f"{WEO_BASE}/{'/'.join(indicators)}/{'/'.join(countries)}", headers={"Accept": "application/json"})
+        vals = r.json().get("values") or {}
+        out = {}
+        for ind in indicators:
+            d = vals.get(ind) or {}
+            df = pd.DataFrame({c: pd.Series(d[c], dtype=float) for c in countries if c in d})
+            if not df.empty:
+                df.index = df.index.astype(int)
+                out[ind] = df.sort_index()
+        return out
+    return _guarded(("weo", indicators, countries), run)
+
 # ── UN Comtrade (exports/imports by HS chapter) ───────────────────────────────
 # The public preview endpoint needs no key but allows ~1 request at a time (parallel calls get
 # HTTP 429 instantly - verified) and takes ~5-10s per month. So the months are filled by ONE
@@ -752,7 +778,18 @@ REQ_IR   = ("MFS_IR", "IDN.*.M", "2005")          # BI policy-related, deposit, 
 REQ_ER   = ("ER", "IDN.XDC_USD.*.M", "2000")      # IDR per USD, monthly
 REQ_MA   = ("MFS_MA", "IDN.*.*.M", "2005")        # broad / base money
 REQ_QNEA = ("QNEA", "IDN.*.*.*.*.Q", "2005")      # GDP by expenditure
-IMF_REQUESTS = [REQ_BOP, REQ_IL, REQ_CPI, REQ_ITG, REQ_IMTS, REQ_IR, REQ_ER, REQ_MA, REQ_QNEA]
+# General-government operations, annual, % of GDP (GFS_SOO dims COUNTRY.SECTOR.GFS_GRP.INDICATOR.
+# TYPE_OF_TRANSFORMATION.FREQUENCY). Clean and internally consistent, but only to 2023.
+GFS_REV = {"G111_T": "Income & profit taxes", "G114_T": "Goods & services taxes (VAT, excise)",
+           "G115_T": "Trade taxes", "G14_T": "Non-tax revenue (incl. resources)"}
+GFS_EXP = {"G21_T": "Compensation of employees", "G22_T": "Goods & services", "G24_T": "Interest",
+           "G25_T": "Subsidies (energy, food)", "G26_T": "Grants", "G27_T": "Social benefits", "G28_T": "Other"}
+REQ_GFS  = ("GFS_SOO", "IDN.S13.*." + "+".join(["G1_T", "G11_T", "G2_T", "GNLB_T", "GNOB_T", *GFS_REV, *GFS_EXP]) + ".POGDP_PT.A", "2005")
+# Budgetary central government balance sheet, quarterly, rupiah. The QGFS *flow* series for
+# Indonesia are unusable (negative quarterly tax take, repeated/YTD quarters - checked), so only
+# the debt stocks are used.
+REQ_QGFS = ("QGFS", "IDN.BS.S1311B.F3_L_SP_XDC+F4_L_SP_XDC+G63GMV_L_SP_XDC+L_F_L_SP_XDC+L_D_L_SP_XDC.Q", "2010")
+IMF_REQUESTS = [REQ_BOP, REQ_IL, REQ_CPI, REQ_ITG, REQ_IMTS, REQ_IR, REQ_ER, REQ_MA, REQ_QNEA, REQ_GFS, REQ_QGFS]
 BIS_REQUESTS = [("WS_CBPOL", "D.ID"), ("WS_EER", "M.R.B.ID"), ("WS_EER", "M.N.B.ID"),
                 ("WS_SPP", "Q.ID.R.628"), ("WS_SPP", "Q.ID.N.628")]
 
@@ -806,6 +843,7 @@ prefetch(_yf_batch_raw, tuple(VOL_TICKERS), MARKETS_HIST_START)
 prefetch(_phei_curve_raw)
 prefetch(_bi_inflation_raw)
 prefetch(_bi_reserves_raw)
+prefetch(_weo_raw, tuple(WEO_FISCAL), tuple(FISCAL_PEERS))
 prefetch(_bis_raw, "WS_CBPOL", "D.US")
 if FRED_API_KEY:
     for _sid in UST_SERIES.values():
@@ -1132,6 +1170,7 @@ tabs = st.tabs([
     "Current Account",
     "Trade",
     "Growth",
+    "Fiscal",
     "Indonesia Markets",
     "Economic Calendar",
 ])
@@ -1944,9 +1983,280 @@ with tabs[5]:
                "subscription-only or BPS/BI-only), so growth is quarterly.")
 
 # ════════════════════════════════════════════════════════════════════════════════
-# TAB 7 — Indonesia Markets
+# TAB 7 — Fiscal
 # ════════════════════════════════════════════════════════════════════════════════
+def _drop_glitches(s: pd.Series, tol=0.15) -> pd.Series:
+    """QGFS stock series carry one-quarter reporting glitches (e.g. 2020-Q1 debt = the 2021-Q1
+    figure, Q4 loan spikes that reverse next quarter). Drop points >tol away from the centred
+    5-quarter median."""
+    s = s.dropna()
+    if len(s) < 5:
+        return s
+    med = s.rolling(5, center=True, min_periods=3).median()
+    return s[((s / med - 1).abs() <= tol) | med.isna()]
+
+def _annual_line(fig, s, name, color, width=2.2, secondary_y=None, proj_from=None, fmt=".1f", suffix="%"):
+    """Actual years solid, IMF projections dashed (they overlap at the last actual year so the line is unbroken)."""
+    s = s.dropna()
+    kw = {} if secondary_y is None else {"secondary_y": secondary_y}
+    act = s[s.index < proj_from] if proj_from else s
+    proj = s[s.index >= proj_from - 1] if proj_from else s.iloc[0:0]
+    ht = f"%{{x}}<br>{name}: %{{y:{fmt}}}{suffix}<extra></extra>"
+    fig.add_trace(go.Scatter(x=act.index, y=act.values, name=name, mode="lines+markers", line=dict(color=color, width=width),
+                             marker=dict(size=5), hovertemplate=ht), **kw)
+    if len(proj) > 1:
+        fig.add_trace(go.Scatter(x=proj.index, y=proj.values, name=f"{name} (IMF proj.)", mode="lines+markers",
+                                 line=dict(color=color, width=width, dash="dot"), marker=dict(size=4, symbol="circle-open"),
+                                 hovertemplate=f"%{{x}} (proj.)<br>{name}: %{{y:{fmt}}}{suffix}<extra></extra>", showlegend=False), **kw)
+
+def _annual_stack(parts: pd.DataFrame, total: pd.Series, title, total_name, colors):
+    fig = go.Figure()
+    for i, c in enumerate(parts.columns):
+        v = parts[c].dropna()
+        fig.add_trace(go.Bar(x=v.index, y=v.values, name=c, marker_color=colors.get(c) or PALETTE[i % len(PALETTE)],
+                             hovertemplate=f"%{{x}}<br>{c}: %{{y:.2f}}% of GDP<extra></extra>"))
+    t = total.dropna()
+    fig.add_trace(go.Scatter(x=t.index, y=t.values, name=total_name, mode="lines+markers", line=dict(color="#e0e0e0", width=2),
+                             marker=dict(size=5), hovertemplate=f"%{{x}}<br>{total_name}: %{{y:.2f}}% of GDP<extra></extra>"))
+    fig.update_layout(**base_layout(title))
+    fig.update_layout(barmode="relative")
+    fig.update_yaxes(ticksuffix="%")
+    fig.update_xaxes(dtick=2)
+    return fig
+
 with tabs[6]:
+    st.header("Fiscal Policy & Government Debt")
+    with st.spinner("Loading fiscal data…"):
+        try:
+            weo = _weo_raw(tuple(WEO_FISCAL), tuple(FISCAL_PEERS))
+        except Exception as e:
+            weo = {}
+            st.warning(f"Could not load the IMF World Economic Outlook fiscal series: {e}")
+        gfs_raw = imf_load(*REQ_GFS, what="government finance statistics")
+        qgfs_raw = imf_load(*REQ_QGFS, what="central government balance sheet")
+        qn_f = imf_load(*REQ_QNEA, what="national accounts")
+
+    THIS_YEAR = pd.Timestamp.today().year       # IMF figures from the current year on are projections
+    LAST_ACT = THIS_YEAR - 1
+    y0 = max(min(pd.Timestamp(START).year, THIS_YEAR - 15), 2000)   # annual charts: at least 15 years whatever the slider says
+
+    def weo_idn(code):
+        df = weo.get(code)
+        return df["IDN"].dropna() if df is not None and "IDN" in df else pd.Series(dtype=float)
+
+    w = pd.DataFrame({name: weo_idn(code) for code, name in WEO_FISCAL.items()})
+    if {"Overall balance", "Primary balance", "Revenue"} <= set(w):
+        w["Interest"] = w["Primary balance"] - w["Overall balance"]          # net interest, % of GDP
+        w["Interest % revenue"] = w["Interest"] / w["Revenue"] * 100
+    w_c = w[w.index >= y0] if not w.empty else w
+
+    def gfs(code):
+        v = imf_pick(gfs_raw, INDICATOR=code, SECTOR="S13").copy()      # copy: don't re-index the cached series
+        if not isinstance(v.index, pd.DatetimeIndex):
+            return pd.Series(dtype=float)
+        v.index = v.index.year
+        return v
+    g = pd.DataFrame({c: gfs(c) for c in ["G1_T", "G11_T", "G2_T", "G24_T", "GNLB_T", *GFS_REV, *GFS_EXP]})
+    g = g[g.index >= y0] if not g.empty else g
+
+    def qgfs(code):
+        return imf_pick(qgfs_raw, INDICATOR=code) / 1e12          # IDR tn
+    debt_tot = _drop_glitches(qgfs("G63GMV_L_SP_XDC"))
+    debt_sec = _drop_glitches(qgfs("F3_L_SP_XDC"))
+    debt_loan = qgfs("F4_L_SP_XDC").dropna()   # not filtered: the Q4 jumps recur every year, so they aren't one-off glitches
+    hold_f, hold_d = qgfs("L_F_L_SP_XDC"), qgfs("L_D_L_SP_XDC")
+    foreign_share = _drop_glitches((hold_f / (hold_f + hold_d) * 100).dropna(), tol=0.10)
+    gdp_nom = imf_pick(qn_f, INDICATOR="B1GQ", PRICE_TYPE="V", S_ADJUSTMENT="NSA", TYPE_OF_TRANSFORMATION="XDC")
+    gdp_4q = gdp_nom.rolling(4).sum().dropna() / 1e12                 # IDR tn, trailing 4 quarters
+    debt_gdp_q = (debt_tot / gdp_4q.reindex(debt_tot.index)).dropna() * 100
+
+    # ── headline numbers ──
+    def _at(s, yr):
+        return float(s.loc[yr]) if yr in s.index and pd.notna(s.loc[yr]) else None
+    def _mfmt(v, suf="%"):
+        return "N/A" if v is None else f"{v:.1f}{suf}"
+    def _dfmt(a, b, suf="pp"):
+        return None if a is None or b is None else f"{round(a - b, 1) + 0:+.1f}{suf} y/y"   # + 0 turns -0.0 into 0.0
+    bal, prim, debt_a = (w.get(c, pd.Series(dtype=float)) for c in ["Overall balance", "Primary balance", "Gross debt"])
+    int_rev = w.get("Interest % revenue", pd.Series(dtype=float)).dropna()
+    m = st.columns(6)
+    m[0].metric(f"Balance {LAST_ACT}", _mfmt(_at(bal, LAST_ACT)), _dfmt(_at(bal, LAST_ACT), _at(bal, LAST_ACT - 1)),
+                help="% of GDP. General government net lending/borrowing, IMF Fiscal Monitor. The legal cap is a 3% of GDP deficit.")
+    m[1].metric(f"Balance {THIS_YEAR}F", _mfmt(_at(bal, THIS_YEAR)), _dfmt(_at(bal, THIS_YEAR), _at(bal, LAST_ACT)),
+                help="% of GDP. IMF Fiscal Monitor projection for the current year.")
+    m[2].metric(f"Primary bal. {LAST_ACT}", _mfmt(_at(prim, LAST_ACT)), _dfmt(_at(prim, LAST_ACT), _at(prim, LAST_ACT - 1)),
+                help="% of GDP. Balance excluding interest payments - the part the government controls directly.")
+    m[3].metric(f"Debt {LAST_ACT}", _mfmt(_at(debt_a, LAST_ACT)), _dfmt(_at(debt_a, LAST_ACT), _at(debt_a, LAST_ACT - 1)),
+                delta_color="inverse", help="% of GDP. General government gross debt, IMF Fiscal Monitor. The legal cap is 60% of GDP.")
+    m[4].metric(f"Interest/rev. {LAST_ACT}", _mfmt(_at(int_rev, LAST_ACT), "%"),
+                _dfmt(_at(int_rev, LAST_ACT), _at(int_rev, LAST_ACT - 1)), delta_color="inverse",
+                help="Net interest (primary minus overall balance) as a share of general government revenue, IMF Fiscal Monitor.")
+    fs_lbl = f"Q{foreign_share.index[-1].quarter}-{foreign_share.index[-1].year % 100:02d}" if len(foreign_share) else ""
+    m[5].metric(f"Foreign-held {fs_lbl}", _mfmt(float(foreign_share.iloc[-1]) if len(foreign_share) else None, "%"),
+                _dfmt(float(foreign_share.iloc[-1]), float(foreign_share.iloc[-5])) if len(foreign_share) > 4 else None,
+                help="Central government debt owed to non-residents, % of total (IMF QGFS; includes loans and global bonds, "
+                     "so it is higher than the ~14% foreign share of tradable rupiah SBN).")
+
+    # ── 1. balance vs the 3% cap ──
+    fig_bal = go.Figure()
+    if not w_c.empty:
+        ob = w_c["Overall balance"].dropna()
+        fig_bal.add_trace(go.Bar(x=ob.index, y=ob.values, name="Overall balance",
+                                 marker_color=["#ef5350" if v < -3 else "#42a5f5" for v in ob.values],
+                                 marker_opacity=[0.45 if yr >= THIS_YEAR else 0.9 for yr in ob.index],
+                                 hovertemplate="%{x}<br>Overall balance: %{y:.2f}% of GDP<extra></extra>"))
+        _annual_line(fig_bal, w_c["Primary balance"], "Primary balance", "#ff9800", proj_from=THIS_YEAR)
+        if "Cyclically adj. primary balance" in w_c:
+            _annual_line(fig_bal, w_c["Cyclically adj. primary balance"], "Cyclically adj. primary balance", "#26a69a",
+                         proj_from=THIS_YEAR, width=1.4)
+    fig_bal.add_hline(y=-3, line_dash="dash", line_color="#ef5350", annotation_text="3% deficit cap", annotation_position="bottom left")
+    fig_bal.add_hline(y=0, line_dash="dot", line_color="#555")
+    if y0 <= 2022:
+        fig_bal.add_vrect(x0=2019.5, x1=2022.5, fillcolor="#8a94a6", opacity=0.08, line_width=0,
+                          annotation_text="cap suspended", annotation_position="bottom left", annotation_font_size=10)
+    if not w_c.empty and w_c.index.max() >= THIS_YEAR:
+        fig_bal.add_vrect(x0=THIS_YEAR - 0.5, x1=w_c.index.max() + 0.5, fillcolor="#ab47bc", opacity=0.06, line_width=0,
+                          annotation_text="IMF proj.", annotation_position="bottom right", annotation_font_size=10)
+    fig_bal.update_layout(**base_layout("General Government Balance (% of GDP)"))
+    fig_bal.update_yaxes(ticksuffix="%")
+
+    # ── 2. debt vs the 60% cap ──
+    fig_debt = go.Figure()
+    if not w_c.empty:
+        _annual_line(fig_debt, w_c["Gross debt"], "Gross debt (IMF, general govt)", "#ab47bc", proj_from=THIS_YEAR, width=2.6)
+    if len(debt_gdp_q):
+        dq = debt_gdp_q[debt_gdp_q.index.year >= y0]
+        fig_debt.add_trace(go.Scatter(x=dq.index.year + (dq.index.quarter - 0.5) / 4, y=dq.values, mode="lines",
+                                      name="Central govt debt, market value (QGFS, quarterly)", line=dict(color="#26a69a", width=1.6),
+                                      text=[f"{d.year}-Q{d.quarter}" for d in dq.index],
+                                      hovertemplate="%{text}<br>Central govt debt: %{y:.1f}% of GDP<extra></extra>"))
+    fig_debt.add_hline(y=60, line_dash="dash", line_color="#ef5350", annotation_text="60% legal debt cap", annotation_position="bottom left")
+    fig_debt.update_layout(**base_layout("Government Debt (% of GDP)"))
+    fig_debt.update_yaxes(ticksuffix="%", rangemode="tozero")
+
+    # ── 3. revenue vs expenditure ──
+    fig_rx = go.Figure()
+    if not w_c.empty:
+        _annual_line(fig_rx, w_c["Revenue"], "Revenue", "#26a69a", proj_from=THIS_YEAR)
+        _annual_line(fig_rx, w_c["Expenditure"], "Expenditure", "#ef5350", proj_from=THIS_YEAR)
+    if "G11_T" in g and g["G11_T"].notna().any():
+        _annual_line(fig_rx, g["G11_T"], "Tax revenue (GFS)", "#42a5f5", width=1.6)
+    fig_rx.update_layout(**base_layout("Revenue vs Expenditure (% of GDP)"))
+    fig_rx.update_yaxes(ticksuffix="%")
+
+    # ── 4. interest burden ──
+    fig_int = make_subplots(specs=[[{"secondary_y": True}]])
+    if "Interest" in w_c:
+        it = w_c["Interest"].dropna()
+        fig_int.add_trace(go.Bar(x=it.index, y=it.values, name="Interest, % of GDP", marker_color="#ff9800",
+                                 marker_opacity=[0.4 if yr >= THIS_YEAR else 0.75 for yr in it.index],
+                                 hovertemplate="%{x}<br>Interest: %{y:.2f}% of GDP<extra></extra>"), secondary_y=False)
+        _annual_line(fig_int, w_c["Interest % revenue"], "Interest, % of revenue", "#ef5350", secondary_y=True, proj_from=THIS_YEAR)
+    fig_int.update_layout(**base_layout("Interest Burden (General Government)"))
+    fig_int.update_yaxes(ticksuffix="%", title_text="% of GDP", secondary_y=False, rangemode="tozero")
+    fig_int.update_yaxes(ticksuffix="%", title_text="% of revenue", secondary_y=True, rangemode="tozero", showgrid=False)
+
+    # ── 5./6. revenue and spending mix ──
+    rev_mix = g[[c for c in GFS_REV if c in g]].rename(columns=GFS_REV).dropna(how="all")
+    if not rev_mix.empty:
+        rev_mix["Other taxes"] = (g["G11_T"] - g[[c for c in ["G111_T", "G114_T", "G115_T"] if c in g]].sum(axis=1, min_count=1)).clip(lower=0)
+    fig_rev = _annual_stack(rev_mix, g.get("G1_T", pd.Series(dtype=float)), "Revenue Mix (% of GDP)", "Total revenue",
+                            {"Income & profit taxes": "#42a5f5", "Goods & services taxes (VAT, excise)": "#26a69a", "Trade taxes": "#ff9800",
+                             "Other taxes": "#8a94a6", "Non-tax revenue (incl. resources)": "#ab47bc"})
+    exp_mix = g[[c for c in GFS_EXP if c in g]].rename(columns=GFS_EXP).dropna(how="all")
+    fig_exp = _annual_stack(exp_mix, g.get("G2_T", pd.Series(dtype=float)), "Expense Mix (% of GDP)", "Total expense",
+                            {"Compensation of employees": "#42a5f5", "Goods & services": "#26a69a", "Interest": "#ef5350",
+                             "Subsidies (energy, food)": "#ff9800", "Grants": "#8a94a6", "Social benefits": "#ab47bc", "Other": "#555"})
+
+    # ── 7. central government debt stock by instrument + foreign share ──
+    fig_stock = make_subplots(specs=[[{"secondary_y": True}]])
+    stock = pd.DataFrame({"Debt securities (SBN, global bonds)": debt_sec, "Loans": debt_loan, "_total": debt_tot}).dropna()
+    if not stock.empty:
+        stock["Other liabilities"] = (stock["_total"] - stock.iloc[:, 0] - stock["Loans"]).clip(lower=0)
+        stock = _clip(stock.drop(columns="_total"))
+        for c, col in [("Debt securities (SBN, global bonds)", "#42a5f5"), ("Loans", "#ff9800"), ("Other liabilities", "#8a94a6")]:
+            fig_stock.add_trace(go.Bar(x=stock.index, y=stock[c].values, name=c, marker_color=col,
+                                       hovertemplate=f"%{{x|%Y-%m}}<br>{c}: IDR %{{y:,.0f}}tn<extra></extra>"), secondary_y=False)
+    if len(foreign_share):
+        fsc = _clip(foreign_share)
+        fig_stock.add_trace(go.Scatter(x=fsc.index, y=fsc.values, name="Foreign-held share (rhs)", mode="lines+markers",
+                                       line=dict(color="#e0e0e0", width=2), marker=dict(size=4)), secondary_y=True)
+    fig_stock.update_layout(**base_layout("Central Government Debt Stock (IDR tn) & Foreign-Held Share"))
+    fig_stock.update_layout(barmode="stack")
+    fig_stock.update_yaxes(tickprefix="", ticksuffix="tn", secondary_y=False)
+    fig_stock.update_yaxes(ticksuffix="%", secondary_y=True, showgrid=False)
+
+    # ── 8. peers ──
+    def _peer_bar(code, title, ref=None, ref_lbl=None, ascending=True):
+        df = weo.get(code)
+        fig = go.Figure()
+        if df is not None and LAST_ACT in df.index:
+            row = df.loc[LAST_ACT].rename(index=FISCAL_PEERS).dropna().sort_values(ascending=ascending)
+            proj = df.loc[THIS_YEAR].rename(index=FISCAL_PEERS) if THIS_YEAR in df.index else pd.Series(dtype=float)
+            fig.add_trace(go.Bar(y=row.index, x=row.values, orientation="h", name=str(LAST_ACT),
+                                 marker_color=["#ff9800" if c == "Indonesia" else "#42a5f5" for c in row.index],
+                                 hovertemplate=f"%{{y}} {LAST_ACT}: %{{x:.1f}}% of GDP<extra></extra>"))
+            p = proj.reindex(row.index)
+            fig.add_trace(go.Scatter(y=p.index, x=p.values, mode="markers", name=f"{THIS_YEAR} IMF proj.",
+                                     marker=dict(symbol="diamond-open", size=9, color="#e0e0e0"),
+                                     hovertemplate=f"%{{y}} {THIS_YEAR} proj.: %{{x:.1f}}% of GDP<extra></extra>"))
+        if ref is not None:
+            fig.add_vline(x=ref, line_dash="dash", line_color="#ef5350", annotation_text=ref_lbl, annotation_position="top")
+        fig.update_layout(**base_layout(title, height=440))
+        fig.update_xaxes(ticksuffix="%")
+        return fig
+    fig_pb = _peer_bar("GGXCNL_G01_GDP_PT", f"Fiscal Balance vs EM Peers ({LAST_ACT}, % of GDP)", -3, "IDN 3% cap", ascending=False)
+    fig_pd = _peer_bar("G_XWDG_G01_GDP_PT", f"Gross Debt vs EM Peers ({LAST_ACT}, % of GDP)", 60, "IDN 60% cap")
+    _pb, _pd = "GGXCNL_G01_GDP_PT", "G_XWDG_G01_GDP_PT"
+    peers_df = (pd.DataFrame({f"Balance {LAST_ACT}": weo[_pb].loc[LAST_ACT], f"Debt {LAST_ACT}": weo[_pd].loc[LAST_ACT]}).rename(index=FISCAL_PEERS)
+                if {_pb, _pd} <= set(weo) and LAST_ACT in weo[_pb].index and LAST_ACT in weo[_pd].index else None)
+
+    st.markdown('<div class="section-header">Deficit & Debt</div>', unsafe_allow_html=True)
+    render_two_col([
+        ("Fiscal Balance", fig_bal, w_c),
+        ("Government Debt", fig_debt, w_c[["Gross debt"]] if "Gross debt" in w_c else None),
+        ("Revenue vs Expenditure", fig_rx, w_c),
+        ("Interest Burden", fig_int, w_c[[c for c in ["Interest", "Interest % revenue"] if c in w_c]]),
+    ])
+    st.caption(f"General government, IMF Fiscal Monitor (latest vintage on the IMF DataMapper); "
+               f"{THIS_YEAR} onward are IMF projections (dotted / faded). Interest = primary minus overall balance. Indonesia's State Finance Law 17/2003 caps the deficit "
+               "at 3% and debt at 60% of GDP; the deficit cap was suspended for 2020-22 (Perppu 1/2020). The quarterly debt line is the "
+               "budgetary central government at market value (IMF QGFS) over trailing-4-quarter nominal GDP, so it sits above the "
+               "IMF's face-value general-government figure.")
+
+    st.markdown('<div class="section-header">What the Government Collects & Spends</div>', unsafe_allow_html=True)
+    render_two_col([
+        ("Revenue Mix", fig_rev, rev_mix),
+        ("Expense Mix", fig_exp, exp_mix),
+    ])
+    last_gfs = int(g.dropna(how="all").index.max()) if not g.dropna(how="all").empty else None
+    st.caption(f"IMF Government Finance Statistics, general government, accrual basis (latest year: {last_gfs or 'n/a'}). "
+               "Expense excludes capital spending (net investment in non-financial assets), so total expense is below the IMF "
+               "Fiscal Monitor expenditure. Non-tax revenue is mostly oil, gas and mineral royalties and SOE dividends, which is why it tracks "
+               "commodity prices; subsidies are mainly fuel and electricity.")
+
+    st.markdown('<div class="section-header">Debt Stock & Who Holds It</div>', unsafe_allow_html=True)
+    show_chart(fig_stock, key="chart_fiscal_debt_stock")
+    csv_download(pd.concat([stock, foreign_share.rename("Foreign-held share %")], axis=1) if not stock.empty else None, "Central Govt Debt Stock")
+    st.caption("Budgetary central government liabilities at market value (IMF QGFS, quarterly). One-quarter reporting glitches "
+               "in the IMF series (e.g. 2020-Q1 reported equal to 2021-Q1) are dropped. Foreign-held share covers all debt owed to "
+               "non-residents - global USD/EUR/JPY bonds and official loans as well as foreign holdings of rupiah SBN. "
+               "The foreign share steps up in 2023-Q1 and stays there (a level break in the IMF series), and reported loans "
+               "jump every Q4 and fall back in Q1 - both are shown as reported.")
+
+    st.markdown('<div class="section-header">Peer Comparison</div>', unsafe_allow_html=True)
+    render_two_col([
+        ("Fiscal Balance vs Peers", fig_pb, peers_df),
+        ("Gross Debt vs Peers", fig_pd),
+    ])
+    st.caption("IMF Fiscal Monitor, general government. Bars are the last full year; diamonds are the IMF's projection for the current year. "
+               "Monthly budget (APBN) realisation is published by the Ministry of Finance only as PDF/press releases and its data "
+               "portal blocks API access, so the tab has no in-year monthly deficit tracker.")
+
+# ════════════════════════════════════════════════════════════════════════════════
+# TAB 8 — Indonesia Markets
+# ════════════════════════════════════════════════════════════════════════════════
+with tabs[7]:
     st.header("Indonesia Markets")
     st.caption("Equities, rupiah and Indonesia-relevant commodities. Charts follow the global date range; returns and "
                "z-scores use a fixed lookback since 2015.")
@@ -2167,9 +2477,9 @@ with tabs[6]:
     render_two_col([("Index and Stock Returns", f_ret, ret), ("Index and Stock Z-Scores", f_z, z)])
 
 # ════════════════════════════════════════════════════════════════════════════════
-# TAB 8 — Economic Calendar
+# TAB 9 — Economic Calendar
 # ════════════════════════════════════════════════════════════════════════════════
-with tabs[7]:
+with tabs[8]:
     st.header("Economic Calendar")
     st.caption("Live Investing.com economic calendar widget — Indonesia (IDR) events, all importance levels, times in "
                "GMT+8 (Singapore). Use the widget's own controls to change dates or timezone.")
